@@ -76,6 +76,10 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
+// Global avatar walker — guarantees every tweet in every /api/* response
+// has profileImage populated (falls back to unavatar.io/x/<username>).
+app.use('/api/', avatarWalkerMiddleware);
+
 function requireAuth(req, res, next) {
   if (!SECRET) return next();
   const auth = req.headers['authorization'] || '';
@@ -93,6 +97,37 @@ function scraperGuard(req, res, next) {
 function parseCount(raw, max = 100, fallback = 25) {
   const n = parseInt(raw, 10);
   return isNaN(n) ? fallback : Math.min(Math.max(n, 1), max);
+}
+
+/**
+ * Recursively walk any response payload and force every tweet-shaped
+ * object to have a non-null profileImage. This is the single source of
+ * truth for avatar population, regardless of caching or enrichment path.
+ */
+function forceProfileImage(node) {
+  if (!node || typeof node !== 'object') return node;
+  if (Array.isArray(node)) { node.forEach(forceProfileImage); return node; }
+  // Tweet-shaped: has username — ensure profileImage
+  if (typeof node.username === 'string' && node.username) {
+    if (!node.profileImage) {
+      node.profileImage = `https://unavatar.io/x/${node.username}`;
+    }
+  }
+  for (const k of Object.keys(node)) {
+    const v = node[k];
+    if (v && typeof v === 'object') forceProfileImage(v);
+  }
+  return node;
+}
+
+/**
+ * Express helper: wrap res.json so every payload gets walked through
+ * forceProfileImage before being sent. Applied globally below.
+ */
+function avatarWalkerMiddleware(req, res, next) {
+  const originalJson = res.json.bind(res);
+  res.json = (body) => originalJson(forceProfileImage(body));
+  next();
 }
 
 // ─── Health ──────────────────────────────────────────────────────────────────
