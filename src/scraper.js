@@ -96,13 +96,14 @@ export function formatTweet(tweet) {
   const views    = tweet.views    ?? tweet.viewCount    ?? 0;
 
   const embeddedUser = tweet.user || tweet.author || {};
+  const username = tweet.username || embeddedUser.screen_name || '';
   const embeddedAvatar =
     embeddedUser.profile_image_url_https ||
     embeddedUser.profile_image_url ||
     embeddedUser.avatar ||
     tweet.profileImageUrl ||
     tweet.avatar ||
-    null;
+    (username ? `https://unavatar.io/x/${username}` : null);
 
   // Normalize photos to [{ url }] — what the schema requires
   const photos = Array.isArray(tweet.photos)
@@ -151,9 +152,12 @@ export async function enrichTweets(tweets, batchSize = 5) {
 
   return tweets.map(tweet => {
     const p = profileMap[tweet.username?.toLowerCase()] || {};
+    const fallbackAvatar = tweet.username
+      ? `https://unavatar.io/x/${tweet.username}`
+      : null;
     return {
       ...tweet,
-      profileImage:   p.avatar         || tweet.profileImage || null,
+      profileImage:   p.avatar         || tweet.profileImage || fallbackAvatar,
       displayName:    p.name           || tweet.displayName || tweet.username,
       followersCount: p.followersCount ?? tweet.followersCount ?? 0,
       isVerified:     p.isVerified     || tweet.isVerified || false,
