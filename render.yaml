@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: twitter-tracker-api-2
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node src/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+      - key: TWITTER_COOKIES
+        sync: false
+      - key: TWITTER_USERNAME
+        sync: false
+      - key: TWITTER_PASSWORD
+        sync: false
+      - key: TWITTER_EMAIL
+        sync: false
+      - key: API_SECRET
+        sync: false

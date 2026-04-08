@@ -1,0 +1,21 @@
+{
+  "name": "twitter-tracker-api-2",
+  "version": "1.0.0",
+  "description": "Meme coin trending & narrative tracker API — finds killer narratives and early meme coins from crypto KOLs on X",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "@the-convocation/twitter-scraper": "^0.22.3",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.3.1",
+    "tough-cookie": "^4.1.4"
+  }
+}
