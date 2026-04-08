@@ -42,6 +42,30 @@ app.set('trust proxy', 1);
 app.use(express.json());
 app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
 
+// Request logging — so we can see every incoming call in Render logs
+app.use((req, res, next) => {
+  const start = Date.now();
+  console.log(`→ ${req.method} ${req.originalUrl}`);
+  res.on('finish', () => {
+    console.log(`← ${req.method} ${req.originalUrl} ${res.statusCode} (${Date.now() - start}ms)`);
+  });
+  next();
+});
+
+// Hard request timeout — if any handler takes > 45s, kill it so the client
+// doesn't hang forever. Returns 504 instead of waiting.
+app.use((req, res, next) => {
+  const t = setTimeout(() => {
+    if (!res.headersSent) {
+      console.error(`⏱  Request timeout: ${req.method} ${req.originalUrl}`);
+      res.status(504).json({ error: 'Upstream timeout — scraper too slow. Try again.' });
+    }
+  }, 45_000);
+  res.on('finish', () => clearTimeout(t));
+  res.on('close',  () => clearTimeout(t));
+  next();
+});
+
 const limiter = rateLimit({
   windowMs: 60_000,
   max:      60,

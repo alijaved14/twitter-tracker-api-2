@@ -163,40 +163,72 @@ export async function enrichTweets(tweets, batchSize = 5) {
 
 // ─── Raw search / user fetch helpers ─────────────────────────────────────────
 
-export async function searchTweets(query, count = 30, mode = 'latest') {
+/**
+ * Drain an async iterator with a hard overall timeout. The underlying
+ * scraper iterators can hang indefinitely on network stalls, so we race
+ * each iteration against a timeout. Whatever was collected so far is returned.
+ */
+async function drainWithTimeout(iterable, count, timeoutMs, label) {
+  const out = [];
+  const iter = iterable[Symbol.asyncIterator]();
+  const deadline = Date.now() + timeoutMs;
+
+  try {
+    while (out.length < count) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        console.warn(`[${label}] overall timeout after ${timeoutMs}ms — got ${out.length}`);
+        break;
+      }
+      const next = await Promise.race([
+        iter.next(),
+        new Promise(resolve => setTimeout(() => resolve({ __timeout: true }), remaining)),
+      ]);
+      if (next.__timeout) {
+        console.warn(`[${label}] step timeout — got ${out.length}`);
+        break;
+      }
+      if (next.done) break;
+      out.push(next.value);
+    }
+  } catch (err) {
+    console.error(`[${label}] error:`, err.message);
+  } finally {
+    try { if (typeof iter.return === 'function') await iter.return(); } catch {}
+  }
+  return out;
+}
+
+export async function searchTweets(query, count = 30, mode = 'latest', timeoutMs = 12_000) {
   const cacheKey = `search:${query}:${count}:${mode}`;
   const cached   = tweetCache.get(cacheKey);
   if (cached) return cached;
 
   const searchMode = mode === 'top' ? SearchMode.Top : SearchMode.Latest;
-  const tweets     = [];
-  try {
-    for await (const tweet of scraper.searchTweets(query, count, searchMode)) {
-      tweets.push(formatTweet(tweet));
-      if (tweets.length >= count) break;
-    }
-  } catch (err) {
-    console.error(`[searchTweets] ${query}:`, err.message);
-  }
+  const raw = await drainWithTimeout(
+    scraper.searchTweets(query, count, searchMode),
+    count,
+    timeoutMs,
+    `searchTweets:${query.slice(0, 30)}`
+  );
+  const tweets = raw.map(formatTweet);
 
   tweetCache.set(cacheKey, tweets, TWEET_CACHE_TTL);
   return tweets;
 }
 
-export async function getUserTweets(username, count = 20) {
+export async function getUserTweets(username, count = 20, timeoutMs = 8_000) {
   const cacheKey = `user:${username.toLowerCase()}:${count}`;
   const cached   = tweetCache.get(cacheKey);
   if (cached) return cached;
 
-  const tweets = [];
-  try {
-    for await (const tweet of scraper.getTweets(username, count)) {
-      tweets.push(formatTweet(tweet));
-      if (tweets.length >= count) break;
-    }
-  } catch (err) {
-    console.error(`[getUserTweets] ${username}:`, err.message);
-  }
+  const raw = await drainWithTimeout(
+    scraper.getTweets(username, count),
+    count,
+    timeoutMs,
+    `getUserTweets:${username}`
+  );
+  const tweets = raw.map(formatTweet);
 
   tweetCache.set(cacheKey, tweets, TWEET_CACHE_TTL);
   return tweets;
