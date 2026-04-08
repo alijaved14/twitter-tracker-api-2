@@ -21,12 +21,21 @@
  *  6. Cache results for 60 s so the API is cheap to poll.
  */
 
-import { searchTweets, getUserTweets, enrichTweets } from './scraper.js';
+import { searchTweets, getUserTweets, enrichTweets, isReady } from './scraper.js';
 import { TIER_1, TIER_2, TIER_3, ALL_KOLS, kolTier, NARRATIVE_KEYWORDS } from './kols.js';
 import { TTLCache } from './cache.js';
 
 const resultCache = new TTLCache();
 const CACHE_TTL   = 60_000; // 1 minute
+
+// ─── Background worker state ────────────────────────────────────────────────
+// Instead of scraping inline on every request (which exceeds 45s), a single
+// background worker keeps this cache warm. API handlers serve from the cache
+// instantly — first call on cold start returns whatever is there (maybe []).
+let cachedRanked     = [];     // ranked ticker list
+let cachedTweets     = [];     // raw enriched tweets last fetched
+let lastRefreshedAt  = 0;
+let refreshInFlight  = false;
 
 // Track first-seen timestamps across runs for "new signals"
 const firstSeen = new Map(); // ticker → unix seconds
@@ -83,24 +92,34 @@ const MEME_QUERIES = [
   '(new narrative OR "killer narrative" OR "next meta") min_faves:10 -filter:replies',
 ];
 
-async function fetchKolTweets(perAccount = 8) {
-  // Sample from ALL_KOLS — too many accounts at once will rate-limit
-  const picks = ALL_KOLS.slice(0, 30);
+// SMALL batch — the scraper lib serializes internally, so 30 parallel
+// iterators stall. Keep KOL pulls lean; the targeted searches do most of
+// the work for finding trending coins anyway.
+async function fetchKolTweets(perAccount = 4) {
+  const picks = ALL_KOLS.slice(0, 6);
+  console.log(`[tracker] KOL fetch: ${picks.length} accounts × ${perAccount}`);
   const results = await Promise.allSettled(
-    picks.map(u => getUserTweets(u, perAccount))
+    picks.map(u => getUserTweets(u, perAccount, 6_000))
   );
-  return results
-    .filter(r => r.status === 'fulfilled')
-    .flatMap(r => r.value);
+  const ok = results.filter(r => r.status === 'fulfilled').flatMap(r => r.value);
+  console.log(`[tracker] KOL fetch done: ${ok.length} tweets`);
+  return ok;
 }
 
 async function fetchMemeSearches() {
-  const results = await Promise.allSettled(
-    MEME_QUERIES.map(q => searchTweets(q, 25, 'latest'))
-  );
-  return results
-    .filter(r => r.status === 'fulfilled')
-    .flatMap(r => r.value);
+  console.log(`[tracker] meme searches: ${MEME_QUERIES.length} queries`);
+  // Sequentially — parallel stalls the scraper lib. Each is capped at 10s.
+  const out = [];
+  for (const q of MEME_QUERIES) {
+    try {
+      const tweets = await searchTweets(q, 15, 'latest', 10_000);
+      out.push(...tweets);
+    } catch (err) {
+      console.warn(`[tracker] search failed: ${err.message}`);
+    }
+  }
+  console.log(`[tracker] meme searches done: ${out.length} tweets`);
+  return out;
 }
 
 // ─── Main aggregation ────────────────────────────────────────────────────────
@@ -118,23 +137,75 @@ function scoreTweet(tweet) {
   return tierBoost * verifyBoost * followBoost * engBoost * freshness;
 }
 
-export async function getTrendingMemeCoins({ limit = 25, enrich = true } = {}) {
-  const cacheKey = `memetrend:${limit}:${enrich}`;
-  const cached   = resultCache.get(cacheKey);
-  if (cached) return cached;
+/**
+ * Runs ONCE — does the expensive scraping and updates the in-memory cache.
+ * Call repeatedly from a background interval, NOT from request handlers.
+ */
+async function refreshCache() {
+  if (refreshInFlight) {
+    console.log('[tracker] refresh skipped — previous run still in flight');
+    return;
+  }
+  if (!isReady()) {
+    console.log('[tracker] refresh skipped — scraper not ready');
+    return;
+  }
+  refreshInFlight = true;
+  const t0 = Date.now();
 
-  // 1. Pull from KOLs and targeted searches in parallel
-  const [kolTweets, searchResults] = await Promise.all([
-    fetchKolTweets(6),
-    fetchMemeSearches(),
-  ]);
+  try {
+    console.log('[tracker] 🔄 refreshCache START');
 
-  // 2. Merge + dedupe by tweet id
-  const merged = [...kolTweets, ...searchResults];
-  const unique = Array.from(new Map(merged.filter(t => t && t.id).map(t => [t.id, t])).values());
+    // Searches first (higher-value tweets), then KOLs.
+    const searchResults = await fetchMemeSearches();
+    const kolTweets     = await fetchKolTweets(4);
 
-  // 3. Enrich so profileImage / displayName / followersCount are real values
-  const tweets = enrich ? await enrichTweets(unique) : unique;
+    // Merge + dedupe by tweet id
+    const merged = [...kolTweets, ...searchResults];
+    const unique = Array.from(new Map(merged.filter(t => t && t.id).map(t => [t.id, t])).values());
+
+    // Enrich (best-effort — tight timeout)
+    let tweets = unique;
+    try {
+      tweets = await Promise.race([
+        enrichTweets(unique),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('enrich timeout')), 12_000)),
+      ]);
+    } catch (e) {
+      console.warn(`[tracker] enrichment failed: ${e.message} — using raw tweets`);
+    }
+
+    const ranked = computeRanking(tweets, 100);
+    cachedRanked    = ranked;
+    cachedTweets    = tweets;
+    lastRefreshedAt = Date.now();
+
+    console.log(`[tracker] ✅ refreshCache DONE in ${Date.now() - t0}ms — ${tweets.length} tweets, ${ranked.length} tickers`);
+  } catch (err) {
+    console.error(`[tracker] ❌ refreshCache FAILED after ${Date.now() - t0}ms:`, err.message);
+  } finally {
+    refreshInFlight = false;
+  }
+}
+
+/**
+ * Start the background refresher. Called once at server startup.
+ * Kicks off an immediate refresh, then runs every `intervalMs`.
+ */
+export function startTracker(intervalMs = 90_000) {
+  console.log(`[tracker] starting background refresher (every ${intervalMs / 1000}s)`);
+  // Fire-and-forget the first run; don't block server startup
+  refreshCache().catch(e => console.error('[tracker] initial refresh error:', e.message));
+  setInterval(() => {
+    refreshCache().catch(e => console.error('[tracker] interval refresh error:', e.message));
+  }, intervalMs);
+}
+
+/**
+ * Pure ranking function — no I/O. Scores the given tweets and returns
+ * a sorted list of trending tickers.
+ */
+function computeRanking(tweets, limit) {
 
   // 4. Build ticker → stats map
   const tickerMap = new Map(); // ticker → { mentions, score, tweets[], narratives Set, firstSeen }
@@ -186,13 +257,22 @@ export async function getTrendingMemeCoins({ limit = 25, enrich = true } = {}) {
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
 
-  resultCache.set(cacheKey, ranked, CACHE_TTL);
   return ranked;
 }
 
+// ─── Public API (all instant — serve from cache) ────────────────────────────
+
+export function getTrendingMemeCoins({ limit = 25 } = {}) {
+  return {
+    lastRefreshedAt: lastRefreshedAt ? new Date(lastRefreshedAt).toISOString() : null,
+    refreshing:      refreshInFlight,
+    tickers:         cachedRanked.slice(0, limit),
+  };
+}
+
 // Narrative-level view: clusters tickers by narrative bucket
-export async function getTrendingNarratives({ limit = 10 } = {}) {
-  const tickers = await getTrendingMemeCoins({ limit: 100 });
+export function getTrendingNarratives({ limit = 10 } = {}) {
+  const tickers = cachedRanked;
   const buckets = new Map();
 
   for (const t of tickers) {
@@ -215,15 +295,26 @@ export async function getTrendingNarratives({ limit = 10 } = {}) {
 }
 
 // Early signals — tickers first seen in the last 6h, sorted by velocity
-export async function getNewSignals({ limit = 20 } = {}) {
-  const tickers = await getTrendingMemeCoins({ limit: 100 });
-  return tickers.filter(t => t.isNewSignal).slice(0, limit);
+export function getNewSignals({ limit = 20 } = {}) {
+  return cachedRanked.filter(t => t.isNewSignal).slice(0, limit);
 }
 
-// Cashtag drill-down — all tweets for one ticker
+// Cashtag drill-down — live but tightly timeout-bounded
 export async function getTweetsByCashtag(ticker, count = 30) {
   const clean = ticker.replace(/^\$/, '').toUpperCase();
   const query = `$${clean} -filter:retweets`;
-  const raw   = await searchTweets(query, count, 'latest');
-  return enrichTweets(raw);
+  const raw   = await searchTweets(query, count, 'latest', 10_000);
+  try {
+    return await Promise.race([
+      enrichTweets(raw),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('enrich timeout')), 8_000)),
+    ]);
+  } catch {
+    return raw;
+  }
+}
+
+// Expose raw cached tweets (useful for debug / /api/live-style endpoint)
+export function getCachedTweets(limit = 50) {
+  return cachedTweets.slice(0, limit);
 }

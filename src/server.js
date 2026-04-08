@@ -31,6 +31,7 @@ import {
   getTrendingNarratives,
   getNewSignals,
   getTweetsByCashtag,
+  startTracker,
 } from './memeCoinTracker.js';
 import { ALL_KOLS } from './kols.js';
 
@@ -107,11 +108,17 @@ app.get('/health', (_req, res) => {
  * Ranked list of trending meme coin tickers with mentions, score, narratives,
  * and the top tweets driving the signal.
  */
-app.get('/api/memecoins/trending', requireAuth, scraperGuard, async (req, res) => {
+app.get('/api/memecoins/trending', requireAuth, scraperGuard, (req, res) => {
   try {
     const limit  = parseCount(req.query.limit, 100, 25);
-    const result = await getTrendingMemeCoins({ limit });
-    res.json({ success: true, count: result.length, tickers: result });
+    const result = getTrendingMemeCoins({ limit });
+    res.json({
+      success:         true,
+      lastRefreshedAt: result.lastRefreshedAt,
+      refreshing:      result.refreshing,
+      count:           result.tickers.length,
+      tickers:         result.tickers,
+    });
   } catch (err) {
     console.error('[/api/memecoins/trending]', err.message);
     res.status(500).json({ error: err.message });
@@ -122,10 +129,10 @@ app.get('/api/memecoins/trending', requireAuth, scraperGuard, async (req, res) =
  * GET /api/memecoins/narratives?limit=10
  * Groups trending tickers into narrative buckets (AI agents, dogs, etc.)
  */
-app.get('/api/memecoins/narratives', requireAuth, scraperGuard, async (req, res) => {
+app.get('/api/memecoins/narratives', requireAuth, scraperGuard, (req, res) => {
   try {
     const limit  = parseCount(req.query.limit, 50, 10);
-    const result = await getTrendingNarratives({ limit });
+    const result = getTrendingNarratives({ limit });
     res.json({ success: true, count: result.length, narratives: result });
   } catch (err) {
     console.error('[/api/memecoins/narratives]', err.message);
@@ -137,10 +144,10 @@ app.get('/api/memecoins/narratives', requireAuth, scraperGuard, async (req, res)
  * GET /api/memecoins/new?limit=20
  * Brand-new signals — tickers first seen in the last 6 hours.
  */
-app.get('/api/memecoins/new', requireAuth, scraperGuard, async (req, res) => {
+app.get('/api/memecoins/new', requireAuth, scraperGuard, (req, res) => {
   try {
     const limit  = parseCount(req.query.limit, 50, 20);
-    const result = await getNewSignals({ limit });
+    const result = getNewSignals({ limit });
     res.json({ success: true, count: result.length, signals: result });
   } catch (err) {
     console.error('[/api/memecoins/new]', err.message);
@@ -229,6 +236,11 @@ app.listen(PORT, async () => {
   console.log('🐦  Initialising Twitter scraper...');
   await initScraper();
   console.log(`📡  Ready: ${isReady()}`);
+  if (isReady()) {
+    // Warm the meme coin tracker cache in the background — requests to
+    // /api/memecoins/* are served instantly from this cache.
+    startTracker(90_000);
+  }
 });
 
 process.on('SIGTERM', () => { console.log('SIGTERM — shutting down'); process.exit(0); });
