@@ -2,8 +2,8 @@
  * Twitter scraper singleton — tailored for meme coin tracking.
  * Formats every tweet into the canonical shape expected by the frontend:
  *
- *   profileImage, displayName, username, isVerified, followersCount,
- *   timeParsed, text, photos[].url, likes, retweets, views, permanentUrl
+ * profileImage, displayName, username, isVerified, followersCount,
+ * timeParsed, text, photos[].url, likes, retweets, views, permanentUrl
  */
 
 import { Scraper, SearchMode } from '@the-convocation/twitter-scraper';
@@ -24,6 +24,76 @@ function parseCookieString(raw) {
   return raw.split(';').map(s => Cookie.parse(s.trim())).filter(Boolean);
 }
 
+// ─── Syndication API Helpers (No Auth / High Limits) ─────────────────────────
+
+// 1. Get Avatars from Official Embed CDN
+function getSyndicationToken(tweetId) {
+  return ((Number(tweetId) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
+}
+
+async function fetchSyndicationProfile(tweetId) {
+  try {
+    const token = getSyndicationToken(tweetId);
+    const url = `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&token=${token}`;
+    
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    
+    const data = await res.json();
+    const user = data.user;
+    if (!user) return null;
+
+    return {
+      username: user.screen_name,
+      name: user.name,
+      avatar: user.profile_image_url_https?.replace('_normal', ''),
+      followersCount: user.followers_count, 
+      isVerified: user.is_blue_verified || user.verified || false,
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+// 2. Get Follower Counts from FixTweet/vxTwitter Public API
+async function fetchSyndicationFollowers(usernames) {
+  if (!usernames || usernames.length === 0) return {};
+  try {
+    const counts = {};
+    
+    // Process in batches of 5 to respect the free API limits
+    for (let i = 0; i < usernames.length; i += 5) {
+      const chunk = usernames.slice(i, i + 5);
+      
+      await Promise.all(chunk.map(async (uname) => {
+        try {
+          const res = await fetch(`https://api.fxtwitter.com/${uname}`, { 
+            signal: AbortSignal.timeout(5000),
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+          });
+          
+          if (!res.ok) return;
+          const data = await res.json();
+          
+          if (data && data.user && typeof data.user.followers === 'number') {
+            counts[uname.toLowerCase()] = data.user.followers;
+          }
+        } catch (e) {
+          // ignore individual timeouts
+        }
+      }));
+    }
+    return counts;
+  } catch (err) {
+    console.warn('[SyndicationFollowers] Error fetching batch follower counts', err.message);
+    return {};
+  }
+}
+
+// ─── Init / Auth ─────────────────────────────────────────────────────────────
+
 export async function initScraper() {
   if (initPromise) return initPromise;
 
@@ -31,34 +101,59 @@ export async function initScraper() {
     scraper = new Scraper();
     const cookieEnv = process.env.TWITTER_COOKIES;
 
-    if (!cookieEnv || !cookieEnv.trim()) {
-      console.error('❌ TWITTER_COOKIES env var is not set.');
-      return;
-    }
-
     try {
-      let cookiesToSet;
-      try {
-        const decoded = Buffer.from(cookieEnv.trim(), 'base64').toString('utf8');
-        const arr     = JSON.parse(decoded);
-        if (Array.isArray(arr)) {
-          cookiesToSet = arr.map(c => Cookie.parse(c)).filter(Boolean);
-          console.log('🍪 Loaded cookies from base64 JSON format');
-        } else {
-          throw new Error('not an array');
+      if (!cookieEnv || !cookieEnv.trim()) {
+        console.warn('⚠️ TWITTER_COOKIES env var is not set. Attempting fresh login...');
+        
+        if (!process.env.TWITTER_USERNAME || !process.env.TWITTER_PASSWORD) {
+          throw new Error('TWITTER_USERNAME and TWITTER_PASSWORD must be set if cookies are empty.');
         }
-      } catch {
-        cookiesToSet = parseCookieString(cookieEnv.trim());
-        console.log('🍪 Loaded cookies from plain string format');
+
+        await scraper.login(
+          process.env.TWITTER_USERNAME,
+          process.env.TWITTER_PASSWORD,
+          process.env.TWITTER_EMAIL
+        );
+        
+        const cookies = await scraper.getCookies();
+        const cookieStrings = cookies.map(c => c.toString());
+        const base64Cookies = Buffer.from(JSON.stringify(cookieStrings)).toString('base64');
+        
+        console.log('\n========================================================================');
+        console.log('✅ FRESH LOGIN SUCCESSFUL!');
+        console.log('🚨 Copy the string below and paste it into TWITTER_COOKIES in Render:');
+        console.log('\n' + base64Cookies + '\n');
+        console.log('========================================================================\n');
+        
+        ready = await scraper.isLoggedIn();
+      } else {
+        // Load existing cookies
+        let cookiesToSet;
+        try {
+          const decoded = Buffer.from(cookieEnv.trim(), 'base64').toString('utf8');
+          const arr     = JSON.parse(decoded);
+          if (Array.isArray(arr)) {
+            cookiesToSet = arr.map(c => Cookie.parse(c)).filter(Boolean);
+            console.log('🍪 Loaded cookies from base64 JSON format');
+          } else {
+            throw new Error('not an array');
+          }
+        } catch {
+          cookiesToSet = parseCookieString(cookieEnv.trim());
+          console.log('🍪 Loaded cookies from plain string format');
+        }
+
+        if (!cookiesToSet.length) {
+          throw new Error('No valid cookies could be parsed from TWITTER_COOKIES');
+        }
+
+        await scraper.setCookies(cookiesToSet);
+        ready = await scraper.isLoggedIn();
       }
 
-      if (!cookiesToSet.length) throw new Error('No valid cookies parsed');
-
-      await scraper.setCookies(cookiesToSet);
-      ready = await scraper.isLoggedIn();
       console.log(ready ? '✅ Twitter session active' : '❌ Cookies loaded but session invalid');
     } catch (err) {
-      console.error('❌ Failed to load cookies:', err.message);
+      console.error('❌ Init Error:', err.message);
     }
   })();
 
@@ -75,17 +170,46 @@ export async function getProfile(username) {
   const cached = profileCache.get(key);
   if (cached) return cached;
 
-  const p = await scraper.getProfile(username);
-  const formatted = {
-    username:       p.username   || username,
-    name:           p.name       || username,
-    avatar:         p.avatar     || null,
-    followersCount: p.followersCount ?? 0,
-    isVerified:     p.isBlueVerified || p.isVerified || false,
-  };
+  try {
+    // 1. Try standard scraper first
+    const res = await scraper.getProfile(username);
+    const p = res?.value || res; 
+    
+    if (p && p.username) {
+      const formatted = {
+        username:       p.username,
+        name:           p.name,
+        avatar:         p.avatar,
+        followersCount: p.followersCount || 0,
+        isVerified:     p.isBlueVerified || p.isVerified || false,
+      };
+      profileCache.set(key, formatted, PROFILE_CACHE_TTL);
+      return formatted;
+    }
+  } catch (err) {
+    console.warn(`[getProfile] Scraper failed for ${username}, trying syndication fallback...`);
+  }
 
-  profileCache.set(key, formatted, PROFILE_CACHE_TTL);
-  return formatted;
+  // 2. Fallback: Grab their latest tweet and extract profile via Syndication
+  try {
+    const tweetsIter = scraper.getTweets(username, 1);
+    for await (const tweet of tweetsIter) {
+      if (tweet.id) {
+        const profile = await fetchSyndicationProfile(tweet.id);
+        const followerData = await fetchSyndicationFollowers([username]);
+        
+        if (profile) {
+           profile.followersCount = followerData[username.toLowerCase()] ?? profile.followersCount ?? 0;
+           profileCache.set(key, profile, PROFILE_CACHE_TTL);
+           return profile;
+        }
+      }
+    }
+  } catch (e) {
+     // Ignore
+  }
+
+  throw new Error(`Profile fetch failed for ${username}`);
 }
 
 // ─── Canonical tweet formatter (matches the exact response schema) ───────────
@@ -128,41 +252,49 @@ export function formatTweet(tweet) {
   };
 }
 
-// Batched profile enrichment so displayName / profileImage / followersCount
-// are never the default zero/empty values.
-export async function enrichTweets(tweets, batchSize = 5) {
-  const usernames = [...new Set(tweets.map(t => t.username).filter(Boolean))];
-  const profileMap = {};
+export async function enrichTweets(tweets, batchSize = 5) { // Keeps signature for safety, but we don't need batchSize anymore
+  const uniqueUsernames = [...new Set(tweets.map(t => t.username).filter(Boolean))];
+  
+  // Only query FixTweet for users missing from the cache OR stuck with 0 followers
+  const missingFollowers = uniqueUsernames.filter(uname => {
+    const cached = profileCache.get(`profile:${uname.toLowerCase()}`);
+    return !cached || !cached.followersCount; 
+  });
 
-  const fetchOne = (u) =>
-    Promise.race([
-      getProfile(u),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('profile timeout')), 4_000)),
-    ]);
+  const followerData = await fetchSyndicationFollowers(missingFollowers);
 
-  for (let i = 0; i < usernames.length; i += batchSize) {
-    const batch = usernames.slice(i, i + batchSize);
-    const results = await Promise.allSettled(batch.map(fetchOne));
-    batch.forEach((u, idx) => {
-      if (results[idx].status === 'fulfilled') {
-        profileMap[u.toLowerCase()] = results[idx].value;
-      }
-    });
-  }
+  return Promise.all(tweets.map(async (tweet) => {
+    const unameLower = tweet.username?.toLowerCase();
+    const cacheKey = `profile:${unameLower}`;
+    let profile = profileCache.get(cacheKey);
 
-  return tweets.map(tweet => {
-    const p = profileMap[tweet.username?.toLowerCase()] || {};
-    const fallbackAvatar = tweet.username
-      ? `https://unavatar.io/x/${tweet.username}`
-      : null;
+    // If completely uncached, fetch avatar via official CDN using the Tweet ID
+    if (!profile && tweet.id) {
+      profile = await fetchSyndicationProfile(tweet.id);
+    }
+
+    // Resolve the highest-priority follower count available
+    const fetchedCount = followerData[unameLower];
+    const realFollowers = (fetchedCount !== undefined && fetchedCount !== null) 
+                          ? fetchedCount 
+                          : (profile?.followersCount || tweet.followersCount || 0);
+
+    // Save/Update the cache so we don't keep pinging the APIs
+    if (profile) {
+      profile.followersCount = realFollowers;
+      profileCache.set(cacheKey, profile, PROFILE_CACHE_TTL);
+    }
+
+    const fallbackAvatar = tweet.username ? `https://unavatar.io/x/${tweet.username}` : null;
+
     return {
       ...tweet,
-      profileImage:   p.avatar         || tweet.profileImage || fallbackAvatar,
-      displayName:    p.name           || tweet.displayName || tweet.username,
-      followersCount: p.followersCount ?? tweet.followersCount ?? 0,
-      isVerified:     p.isVerified     || tweet.isVerified || false,
+      profileImage:   profile?.avatar         || tweet.profileImage || fallbackAvatar,
+      displayName:    profile?.name           || tweet.displayName  || tweet.username,
+      followersCount: realFollowers,
+      isVerified:     profile?.isVerified     || tweet.isVerified   || false,
     };
-  });
+  }));
 }
 
 // ─── Raw search / user fetch helpers ─────────────────────────────────────────
